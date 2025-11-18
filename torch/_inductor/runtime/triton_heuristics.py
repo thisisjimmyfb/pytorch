@@ -2246,7 +2246,6 @@ def cached_autotune(
                     assert tconfig.kwargs["XBLOCK"] == 1
                     tconfig.kwargs.pop("XBLOCK")
 
-        heuristic_config = get_heuristic_config(device.type)
         if inductor_meta.get("profile_bandwidth"):
             return debug_autotuner_cls(
                 fn,
