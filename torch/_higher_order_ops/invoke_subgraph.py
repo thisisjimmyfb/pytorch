@@ -29,6 +29,7 @@ from torch._higher_order_ops.utils import (
 )
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_opaque_type
+from torch._logging import getArtifactLogger
 from torch._ops import HigherOrderOperator
 from torch._subclasses.functional_tensor import disable_functional_mode
 from torch.fx.experimental.proxy_tensor import (
@@ -43,6 +44,8 @@ from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispat
 
 
 invoke_subgraph_counter = 0
+
+annotation_log = getArtifactLogger(__name__, "annotation")
 
 
 # During the tracing of the joint graph, we construct this information. This is
@@ -733,6 +736,13 @@ def _(subgraph, identifier, *operands):
     output_metadata = get_output_metadata(subgraph, *operands)
 
     def autograd_fn_callable(*args):
+        # NB: invoke_subgraph HOP node seq_nr
+        # The sequence number keeps incrementing as we re-trace
+        # the subgraphs. We need to save the seq_nr when we create the
+        # backward autograd node of invoke_subgraph HOP node so we can assign the
+        # correct seq_nr to the forward node later.
+        seq_nr = torch.autograd._get_sequence_nr()
+        subgraph.meta["invoke_subgraph_seq_nr"] = seq_nr
         return InvokeSubgraphAutogradOp.apply(
             subgraph, identifier, output_metadata, *args
         )
@@ -892,9 +902,14 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
 
         with dynamo_timed("invoke_subgraph_proxy_tensor", log_pt2_compile_event=True):
             subgraph_decomp_table = _extract_nested_region_config(subgraph)
-            graph = reenter_make_fx(
-                subgraph, subgraph_decomp_table=subgraph_decomp_table
-            )(*operands)
+
+            # NB: invoke_subgraph subgraph re-trace seq_nr
+            # The joint graph seq_nr will get wrong in the subsequent re-trace (all nodes will have the same seq_nr),
+            # so we preserve the original graph's seq_nr here.
+            with torch.fx.traceback.preserve_node_seq_nr():
+                graph = reenter_make_fx(
+                    subgraph, subgraph_decomp_table=subgraph_decomp_table
+                )(*operands)
 
         from torch._guards import detect_fake_mode
 
@@ -949,6 +964,29 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
     out_proxy = proxy_mode.tracer.create_proxy(
         "call_function", invoke_subgraph, proxy_args, {}
     )
+
+    real_subgraph = subgraph
+    if isinstance(subgraph, FunctionalizeCtxWrapper):
+        real_subgraph = subgraph.subgraph
+    if (
+        isinstance(real_subgraph, torch.fx.GraphModule)
+        and hasattr(real_subgraph, "meta")
+        and "invoke_subgraph_seq_nr" in real_subgraph.meta
+    ):
+        # NB: invoke_subgraph HOP node seq_nr
+        seq_nr = real_subgraph.meta["invoke_subgraph_seq_nr"]
+        out_proxy.node.args[0].meta["seq_nr"] = seq_nr
+        annotation_log.debug(
+            "Overriding invoke_subraph getattr node seq_nr %s to %s",
+            seq_nr,
+            out_proxy.node.args[0].name,
+        )
+        out_proxy.node.meta["seq_nr"] = seq_nr
+        annotation_log.debug(
+            "Overriding invoke_subraph node seq_nr %s to %s",
+            seq_nr,
+            out_proxy.node.name,
+        )
 
     example_out = invoke_subgraph(graph, identifier, *operands)
     return track_tensor_tree(

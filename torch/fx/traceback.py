@@ -2,6 +2,7 @@
 import copy
 import logging
 import traceback
+from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Optional, Union
@@ -20,7 +21,9 @@ __all__ = [
     "annotate",
     "annotate_fn",
     "preserve_node_meta",
+    "preserve_node_seq_nr",
     "has_preserved_node_meta",
+    "has_preserved_node_seq_nr",
     "set_stack_trace",
     "set_grad_fn_seq_nr",
     "reset_grad_fn_seq_nr",
@@ -32,11 +35,15 @@ __all__ = [
     "get_graph_provenance_json",
     "set_current_replay_node",
     "get_current_replay_node",
+    "print_gm_with_seq_nr",
 ]
 
 current_meta: dict[str, Any] = {}
 current_replay_node: Optional[Node] = None
+# Preserve the node meta fields in torch.fx.proxy._COPY_META_FIELDS
 should_preserve_node_meta = False
+# Preserve the "seq_nr" node meta field
+should_preserve_node_seq_nr = False
 
 GRADIENT_ACC_SPECIAL_STACK = (
     "Gradient addition node due to multiple use of tensor around:"
@@ -261,6 +268,19 @@ def preserve_node_meta(enable=True):
 
 
 @compatibility(is_backward_compatible=False)
+@contextmanager
+def preserve_node_seq_nr(preserve_seq_nr=True):
+    global should_preserve_node_seq_nr
+    saved_should_preserve_node_seq_nr = should_preserve_node_seq_nr
+
+    try:
+        should_preserve_node_seq_nr = preserve_seq_nr
+        yield
+    finally:
+        should_preserve_node_seq_nr = saved_should_preserve_node_seq_nr
+
+
+@compatibility(is_backward_compatible=False)
 def set_stack_trace(stack: list[str]):
     global current_meta
 
@@ -403,6 +423,11 @@ def has_preserved_node_meta() -> bool:
 
 
 @compatibility(is_backward_compatible=False)
+def has_preserved_node_seq_nr() -> bool:
+    return should_preserve_node_seq_nr
+
+
+@compatibility(is_backward_compatible=False)
 @contextmanager
 def set_current_meta(node, pass_name=""):
     global current_meta
@@ -500,3 +525,83 @@ def _get_custom_metadata(gm: GraphModule) -> str:
         return custom_metadata
 
     return "\n".join(str(x) for x in helper(gm))
+
+
+def _get_ordered_seq_nr_groups(
+    gm: Union[GraphModule, list[GraphModule]],
+) -> list[list[str]]:
+    """
+    Group call_function nodes by seq_nr, order by seq_nr value,
+    and return a list of lists of node names (sorted alphabetically).
+
+    Args:
+        gm: A single GraphModule or a list of GraphModules to process.
+            When a list is provided, nodes from all graphs are grouped together.
+
+    Returns:
+        A list of lists, where each inner list contains node names that share the same seq_nr,
+        sorted alphabetically. The outer list is ordered by seq_nr value.
+    """
+    # Normalize input to a list
+    if isinstance(gm, GraphModule):
+        gms = [gm]
+    else:
+        gms = gm
+
+    seq_nr_dict: dict[int, list[str]] = defaultdict(list)
+    for graph_module in gms:
+        for node in graph_module.graph.nodes:
+            if node.op == "call_function":
+                seq_nr = node.meta.get("seq_nr")
+                if seq_nr is not None:
+                    seq_nr_dict[seq_nr].append(node.name)
+    # Sort by seq_nr and return list of sorted lists
+    return [sorted(seq_nr_dict[k]) for k in sorted(seq_nr_dict.keys())]
+
+
+@compatibility(is_backward_compatible=False)
+def print_gm_with_seq_nr(gm: GraphModule, seq_nr_key="seq_nr", **kwargs):
+    """
+    A helper method that temporarily put node.meta["seq_nr"] into node annotation with key `seq_nr_key`,
+    and then print the graph. The annotation will be restored after printing.
+    It helps to view the seq_nr on the graphs while debugging.
+    """
+
+    # Store original custom metadata to restore after printing
+    original_custom: dict[Node, Optional[dict]] = {}
+
+    def assign_seq_nr_to_annotation(sub_mod):
+        for node in sub_mod.graph.nodes:
+            if "seq_nr" in node.meta:
+                # Save original custom (could be None if not present)
+                original_custom[node] = node.meta.get("custom")
+                if "custom" not in node.meta:
+                    node.meta["custom"] = {}
+                else:
+                    if "seq_nr_key" in node.meta["custom"]:
+                        raise RuntimeError(
+                            f"seq_nr_key {seq_nr_key} already exists in node.meta['custom']. "
+                            "Please use a different seq_nr_key for printing."
+                        )
+                    # Make a copy to avoid modifying the original
+                    node.meta["custom"] = node.meta["custom"].copy()
+                node.meta["custom"][seq_nr_key] = node.meta["seq_nr"]
+
+    def restore_custom(sub_mod):
+        for node in sub_mod.graph.nodes:
+            if node in original_custom:
+                if original_custom[node] is None:
+                    del node.meta["custom"]
+                else:
+                    node.meta["custom"] = original_custom[node]
+
+    for mod in gm.modules():
+        if isinstance(mod, GraphModule):
+            assign_seq_nr_to_annotation(mod)
+
+    try:
+        gm.print_readable(**kwargs)
+    finally:
+        for mod in gm.modules():
+            if isinstance(mod, GraphModule):
+                restore_custom(mod)
