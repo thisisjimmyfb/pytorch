@@ -2315,7 +2315,6 @@ class SIMDScheduling(BaseScheduling):
         enable_autotune: bool,
         mixed_sizes: bool,
         only_gen_src_code: bool = False,
-<<<<<<< HEAD
     ) -> list[tuple[Optional[str], Any, Any]]:
         """
         Generate kernel code for combo kernel partitions.
@@ -2326,10 +2325,7 @@ class SIMDScheduling(BaseScheduling):
 
         Returns a list of (src_code, kernel, node_group) tuples.
         """
-=======
-    ) -> list[tuple[str, Any, Any]]:
         from .triton import TritonKernel
->>>>>>> 95e8a2bf196 (Make triton kernel class type resolution more robust)
         from .triton_combo_kernel import ComboKernel
 
         # This is currently the only type supported by this method
@@ -2341,7 +2337,6 @@ class SIMDScheduling(BaseScheduling):
             _, (numel, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
             node_schedule = self.generate_node_schedule(nodes, numel, rnumel)
             tiling = self.select_tiling(node_schedule, numel, rnumel)
-<<<<<<< HEAD
             features = SIMDKernelFeatures(node_schedule, numel, rnumel)
             is_persistent_reduction = (
                 features.is_reduction()
@@ -2356,14 +2351,6 @@ class SIMDScheduling(BaseScheduling):
                 rnumel=rnumel,
                 features=features,
                 is_persistent_reduction=is_persistent_reduction,
-=======
-            node_schedule_map[pn] = node_schedule, tiling, numel, rnumel
-            subkernel_map[pn] = ComboKernel.create_triton_kernel(
-                tiling,
-                features=SIMDKernelFeatures(node_schedule, numel, rnumel),
-                optimize_mask=not mixed_sizes,
-                triton_kernel_cls=self.kernel_type,
->>>>>>> 95e8a2bf196 (Make triton kernel class type resolution more robust)
             )
 
         partitions = ComboKernel.horizontal_partition(
@@ -2381,14 +2368,6 @@ class SIMDScheduling(BaseScheduling):
         for node_group in partitions:
             if len(node_group) == 0:
                 continue
-<<<<<<< HEAD
-=======
-            kernel = ComboKernel(
-                triton_kernel_cls=self.kernel_type,
-                enable_autotune=enable_autotune,
-                mixed_sizes=mixed_sizes,
-            )
->>>>>>> 95e8a2bf196 (Make triton kernel class type resolution more robust)
 
             if len(node_group) == 1:
                 # Single-node partition
@@ -2411,6 +2390,7 @@ class SIMDScheduling(BaseScheduling):
             else:
                 # Multi-node: create ComboKernel with combo subkernels
                 kernel = ComboKernel(
+                    triton_kernel_cls=self.kernel_type,
                     enable_autotune=enable_autotune,
                     mixed_sizes=mixed_sizes,
                 )
@@ -2420,6 +2400,7 @@ class SIMDScheduling(BaseScheduling):
                         node_info.tiling,
                         features=node_info.features,
                         optimize_mask=not mixed_sizes,
+                        triton_kernel_cls=self.kernel_type,
                     )
                     self.process_kernel(
                         kernel.create_sub_kernel(subkernel),
