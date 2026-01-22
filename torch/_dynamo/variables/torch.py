@@ -32,7 +32,8 @@ import math
 import re
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import nullcontext
-from typing import Any, NoReturn, Optional, TYPE_CHECKING, TypeVar
+from typing import Any, NoReturn, Optional, TYPE_CHECKING, TypeVar, Union
+from typing_extensions import TypeIs
 
 import torch._C
 import torch._refs
@@ -613,17 +614,26 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
         self,
         value: Callable[..., Any],
         nonstrict_traceable: bool | None = None,
+        leaf_function: bool | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(value, **kwargs)
-        from ..trace_rules import is_nonstrict_trace_callable
+        from ..trace_rules import is_leaf_function, is_nonstrict_trace_callable
 
         if nonstrict_traceable is None:
             nonstrict_traceable = is_nonstrict_trace_callable(value)
+        if leaf_function is None:
+            leaf_function = is_leaf_function(value)
+
         self.nonstrict_traceable = nonstrict_traceable
+        self.leaf_function = leaf_function
 
     def __repr__(self) -> str:
-        return f"TorchInGraphFunctionVariable({self.value}, nonstrict_traceable={self.nonstrict_traceable})"
+        return (
+            f"TorchInGraphFunctionVariable({self.value}, "
+            f"nonstrict_traceable={self.nonstrict_traceable}, "
+            f"leaf_function={self.leaf_function})"
+        )
 
     def get_function(self) -> Callable[..., Any]:
         return self.value
@@ -2133,6 +2143,9 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
         if self.nonstrict_traceable:
             return self._call_nonstrict_traceable_function(tx, args, kwargs)
 
+        if self.leaf_function:
+            return self._call_leaf_function(tx, args, kwargs)
+
         if self.torch_function_override_enabled(tx, args, kwargs):
             return dispatch_torch_function(tx, self, args, kwargs)
 
@@ -2413,8 +2426,14 @@ For now, dynamo will explicitly graph break when it encounters user code with th
         self,
         tx: "InstructionTranslator",
         args: Sequence[VariableTracker],
-        kwargs: "dict[str, VariableTracker]",
-    ) -> "VariableTracker":
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        """
+        Handle calls to @nonstrict_trace decorated functions.
+
+        Flattens arguments to graphable types, invokes the function with
+        fake tensors (allowing non-fake inputs), and wraps the outputs.
+        """
         from torch._higher_order_ops.flat_apply import (
             flat_apply,
             func_to_graphable,
@@ -2619,6 +2638,161 @@ For now, dynamo will explicitly graph break when it encounters user code with th
         )
 
         return out_vt
+
+    def _extract_nn_module_states(
+        self,
+        tx: "InstructionTranslator",
+        args: Sequence[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> tuple[VariableTracker, VariableTracker]:
+        """
+        Extract nn.Module states from arguments for leaf function invocation.
+
+        Replaces nn.Module arguments with LeafModuleState objects containing
+        the module's index (for later retrieval), parameters, and buffers.
+        """
+        import torch.utils._pytree as pytree
+        from torch._dynamo.graph_bytecode_inputs import register_user_object
+        from torch._higher_order_ops.invoke_leaf_function import LeafModuleState
+
+        from .higher_order_ops import _make_inlined
+        from .nn_module import NNModuleVariable, UnspecializedNNModuleVariable
+
+        def is_module_variable(
+            var: VariableTracker,
+        ) -> TypeIs[Union["NNModuleVariable", "UnspecializedNNModuleVariable"]]:
+            return isinstance(var, (NNModuleVariable, UnspecializedNNModuleVariable))
+
+        # First, flatten args/kwargs to find nn.Module variables and register them
+        flat_args_var, tree_spec_var = _make_inlined(tx, pytree.tree_flatten)(
+            VariableTracker.build(tx, (args, kwargs))
+        ).unpack_var_sequence(tx)
+
+        # Build a mapping from module id -> module_index for all nn.Module arguments.
+        module_to_index: dict[int, int] = {}
+        for arg in flat_args_var.unpack_var_sequence(tx):
+            if is_module_variable(arg):
+                if arg.source is None:
+                    unimplemented(
+                        gb_type="leaf_function: nn.Module argument without source",
+                        context=f"module type: {type(arg.value).__name__}",
+                        explanation=(
+                            "leaf_function received an nn.Module argument that cannot be "
+                            "traced back to its origin. This typically happens when the "
+                            "module is created dynamically inside the compiled region."
+                        ),
+                        hints=[
+                            "Ensure the nn.Module is created outside the compiled function "
+                            "and passed as an argument.",
+                            "If the module is a class attribute, access it via self.module_name.",
+                        ],
+                    )
+                assert arg.source is not None  # make linter happy
+                module_to_index[id(arg.value)] = register_user_object(
+                    arg.value, arg.source
+                )
+
+        # if no nn.Module arguments, return original args/kwargs unchanged
+        if not module_to_index:
+            args_var = VariableTracker.build(tx, tuple(args))
+            kwargs_var = VariableTracker.build(tx, kwargs)
+            return args_var, kwargs_var
+
+        # transform nn.Modules to LeafModuleState.
+        def convert_modules_to_states(
+            values: Any, module_to_index: dict[int, int]
+        ) -> Any:
+            def module_to_state(val: Any) -> Any:
+                if isinstance(val, torch.nn.Module):
+                    return LeafModuleState(
+                        nn_module_index=module_to_index[id(val)],
+                        named_parameters=dict(val.named_parameters()),
+                        named_buffers=dict(val.named_buffers()),
+                    )
+                return val
+
+            return pytree.tree_map(module_to_state, values)
+
+        module_to_index_var = VariableTracker.build(tx, module_to_index)
+
+        result_var = _make_inlined(tx, convert_modules_to_states)(
+            VariableTracker.build(tx, (args, kwargs)), module_to_index_var
+        )
+        return result_var.unpack_var_sequence(tx)  # pyrefly: ignore [bad-return]
+
+    def _call_leaf_function(
+        self,
+        tx: "InstructionTranslator",
+        args: Sequence[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        """
+        Handle calls to @leaf_function decorated functions.
+
+        Extracts real and fake implementations from the decorator, processes
+        arguments (including nn.Module state extraction), registers function
+        specs as static attributes, and creates the invoke_leaf_function proxy.
+        """
+        import torch.utils._pytree as pytree
+        from torch._higher_order_ops.flat_apply import func_to_graphable
+        from torch._higher_order_ops.invoke_leaf_function import invoke_leaf_function
+
+        from ..decorators import (
+            get_leaf_function_fake_impl,
+            get_leaf_function_real_impl,
+        )
+        from .builder import wrap_fx_proxy
+        from .higher_order_ops import _make_inlined
+
+        decorated_fn = self.value
+        real_impl = get_leaf_function_real_impl(decorated_fn)
+        fake_impl = get_leaf_function_fake_impl(decorated_fn)
+
+        # fake_impl must be provided by the user via @fn.fake_impl decorator
+        if fake_impl is None:
+            raise ValueError(
+                f"leaf_function '{getattr(decorated_fn, '__name__', decorated_fn)}' "
+                "requires a fake_impl. Please provide one using the @<func>.fake_impl "
+                "decorator. See the leaf_function docstring for details."
+            )
+
+        _, real_impl_spec = func_to_graphable(real_impl)
+        _, fake_impl_spec = func_to_graphable(fake_impl)
+
+        args_with_states, kwargs_with_states = self._extract_nn_module_states(
+            tx, args, kwargs
+        )
+        flat_args_var, input_spec_var = _make_inlined(tx, pytree.tree_flatten)(
+            VariableTracker.build(tx, (args_with_states, kwargs_with_states))
+        ).unpack_var_sequence(tx)
+        flat_arg_proxies = [
+            arg.as_proxy() for arg in flat_args_var.unpack_var_sequence(tx)
+        ]
+        input_spec = (
+            input_spec_var.as_python_constant()
+        )  # pyrefly: ignore [unbound-name]
+
+        def make_spec_proxy(name: str, spec: Any) -> Any:
+            proxy = tx.output.register_static_attr_and_return_proxy(name, spec)
+            proxy.node.type = type(spec)
+            return proxy
+
+        real_impl_proxy = make_spec_proxy("real_fn", real_impl_spec)
+        fake_impl_proxy = make_spec_proxy("fake_fn", fake_impl_spec)
+        input_spec_proxy = make_spec_proxy(
+            f"{decorated_fn.__name__}_input_spec", input_spec
+        )
+
+        invoke_args = (
+            real_impl_proxy,
+            fake_impl_proxy,
+            input_spec_proxy,
+            *flat_arg_proxies,
+        )
+        result_proxy = tx.output.create_proxy(
+            "call_function", invoke_leaf_function, invoke_args, {}
+        )
+        return wrap_fx_proxy(tx, result_proxy)
 
     def _call_ntuple(
         self,
