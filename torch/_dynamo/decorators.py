@@ -332,17 +332,10 @@ def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]:
         to trace through and potentially optimize the code.
 
     Usage:
-        **Supported Inputs**:
-        - Inputs must use pytree-compatible types: tensors, Python primitives
-        (int, float, bool, str), and built-in containers (list, tuple, dict).
-        User-defined classes must be registered as pytree nodes via
-        :func:`torch.utils.pytree.register_pytree_node`.
-        - :class:`torch.nn.Module` can also be passed as input; its parameters and buffers are
-        tracked for autograd. The module must exist outside the compile region.
-
-        **Supported Outputs**: Must be a tuple of tensors: ``return (tensor,)`` for one tensor,
-        ``return (a, b)`` for multiple. Primitive types (int, float, bool, str) can also be
-        included in outputs.
+        **Inputs and Outputs**:
+        - Both inputs and outputs must use pytree-compatible types.
+        Tensors, Python primitives (int, float, bool, str), and built-in containers
+        (list, tuple, dict) are supported by default.
 
         Note: We recommend leaf_functions only accept and return tensors. Though primitive
         types (int, float, bool, str) are supported in inputs and outputs, they may cause
@@ -370,7 +363,14 @@ def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]:
             # At runtime: real function runs (counter increments to 1, 2, 3, ...)
             # But returned count is always 999 (from fake_impl at compile time)
 
-        **fake_impl (required)**: Since the function body is not traced, you must
+        - User-defined classes must be registered via :func:`torch.utils._pytree.register_pytree_node`,
+        :func:`torch.utils._pytree.register_dataclass`, or :func:`torch.utils._pytree.register_constant`.
+
+        - :class:`torch.nn.Module` can also be passed as input; its parameters and buffers
+        are tracked for autograd. The module must exist outside the compile region.
+
+        **fake_impl (required)**:
+        Since the function body is not traced, you must
         provide a shape-inference function via ``@fn.fake_impl``. It runs at compile
         time with FakeTensor inputs (tensors with no data, only metadata) and must
         satisfy the following requirements:
@@ -482,7 +482,7 @@ def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
               @my_leaf_fn.fake_impl
               def my_leaf_fn_fake(x):
-                  return (x @ torch.empty_like(x),)  # OK: uses only args
+                  return (x @ torch.empty_like(x),)  # OK: fake_impl uses only args
 
     Example:
         Wrapping an external linear function as leaf_function. It implements custom kernels via
