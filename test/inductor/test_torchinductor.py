@@ -14514,6 +14514,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
                 assert len(inps) == 0
 
+    @skip_if_triton_cpu  # Triton CPU libdevice lacks ceil support
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_pad_dynamic(self):
         def get_same_padding(x: int, k: int, s: int, d: int):
