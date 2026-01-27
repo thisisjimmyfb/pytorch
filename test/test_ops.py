@@ -3022,7 +3022,7 @@ class TestForwardADWithScalars(TestCase):
                 )
 
 
-instantiate_device_type_tests(TestCommon, globals(), allow_xpu=True)
+instantiate_device_type_tests(TestCommon, globals(), allow_xpu=True, allow_mps=True)
 instantiate_device_type_tests(TestCompositeCompliance, globals())
 instantiate_device_type_tests(TestMathBits, globals())
 instantiate_device_type_tests(TestRefsOpsInfo, globals(), only_for="cpu")
