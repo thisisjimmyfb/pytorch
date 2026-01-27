@@ -576,26 +576,13 @@ class TestDTensorOps(TestCase):
             yield args, kwargs
 
     def run_opinfo_test(
-        self, dtype, op, requires_grad=True, sample_inputs_filter=lambda s: True
+        self, dtype, op, requires_grad=True, sample_filter=None
     ):
         self.mesh = init_device_mesh(DEVICE_TYPE, (self.world_size,))
 
-        # Wrap old-style filter (takes sample) to new-style (takes args, kwargs)
-        def wrapped_filter(args, kwargs):
-            # Reconstruct a minimal sample-like object for the old filter
-            class SampleLike:
-                pass
-
-            s = SampleLike()
-            s.input = args[0] if args else None
-            s.args = tuple(args[1:]) if len(args) > 1 else ()
-            s.kwargs = kwargs
-            return sample_inputs_filter(s)
-
-        # test each op with dist tensor inputs and normal inputs
         def test():
             for args, kwargs in self.iter_valid_samples(
-                op, dtype, requires_grad=requires_grad, sample_filter=wrapped_filter
+                op, dtype, requires_grad=requires_grad, sample_filter=sample_filter
             ):
                 self.run_dtensor_crossref(op.op, args, kwargs)
 
@@ -727,7 +714,7 @@ class TestDTensorOps(TestCase):
             torch.int64,
             op,
             requires_grad=False,
-            sample_inputs_filter=lambda s: s.kwargs["num_classes"] != -1,
+            sample_filter=lambda args, kwargs: kwargs.get("num_classes") != -1,
         )
 
     def run_mean(self):
@@ -838,10 +825,10 @@ class TestLocalDTensorOps(TestDTensorOps):
         self.run_one_hot()
 
     def run_opinfo_test(
-        self, dtype, op, requires_grad=True, sample_inputs_filter=lambda s: True
+        self, dtype, op, requires_grad=True, sample_filter=None
     ):
         with LocalTensorMode(frozenset(range(self.world_size))):
-            super().run_opinfo_test(dtype, op, requires_grad, sample_inputs_filter)
+            super().run_opinfo_test(dtype, op, requires_grad, sample_filter)
 
     def assertEqualOnRank(self, x, y, msg=None, *, rank=0):
         self.assertEqual(x, y, msg)
