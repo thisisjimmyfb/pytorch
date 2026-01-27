@@ -539,26 +539,65 @@ class TestDTensorOps(TestCase):
     def world_size(self) -> int:
         return OP_DB_WORLD_SIZE
 
+    def iter_valid_samples(
+        self,
+        op,
+        dtype,
+        requires_grad=False,
+        sample_filter=None,
+        needs_deepcopy=False,
+    ):
+        """
+        Iterate over valid samples for an op, yielding (args, kwargs) tuples.
+
+        Args:
+            op: The OpInfo object
+            dtype: The dtype to use for sample inputs
+            requires_grad: Whether tensors should require grad
+            sample_filter: Optional callable(args, kwargs) -> bool to filter samples
+            needs_deepcopy: If True, yields deepcopied args/kwargs and skips
+                            samples that can't be deepcopied
+        """
+        samples = op.sample_inputs(DEVICE_TYPE, dtype, requires_grad=requires_grad)
+        for sample in samples:
+            args = [sample.input] + list(sample.args)
+            kwargs = sample.kwargs
+
+            if sample_filter and not sample_filter(args, kwargs):
+                continue
+
+            if needs_deepcopy:
+                try:
+                    args = copy.deepcopy(args)
+                    kwargs = copy.deepcopy(kwargs)
+                except NotImplementedError:
+                    continue
+
+            yield args, kwargs
+
     def run_opinfo_test(
         self, dtype, op, requires_grad=True, sample_inputs_filter=lambda s: True
     ):
         self.mesh = init_device_mesh(DEVICE_TYPE, (self.world_size,))
 
+        # Wrap old-style filter (takes sample) to new-style (takes args, kwargs)
+        def wrapped_filter(args, kwargs):
+            # Reconstruct a minimal sample-like object for the old filter
+            class SampleLike:
+                pass
+
+            s = SampleLike()
+            s.input = args[0] if args else None
+            s.args = tuple(args[1:]) if len(args) > 1 else ()
+            s.kwargs = kwargs
+            return sample_inputs_filter(s)
+
         # test each op with dist tensor inputs and normal inputs
         def test():
-            samples = op.sample_inputs(DEVICE_TYPE, dtype, requires_grad=requires_grad)
-            for sample_input in samples:
-                if not sample_inputs_filter(sample_input):
-                    continue
-                args = [sample_input.input] + list(sample_input.args)
-                kwargs = sample_input.kwargs
-
+            for args, kwargs in self.iter_valid_samples(
+                op, dtype, requires_grad=requires_grad, sample_filter=wrapped_filter
+            ):
                 self.run_dtensor_crossref(op.op, args, kwargs)
-                # we need to figure out a way to test the out variant, out variant testing
-                # is tricky, as we need to pre allocate the dtensor out, some of them rely
-                # on sharding placements to be pre-known (i.e. mm.out)
-                # if isinstance(expected, torch.Tensor) and op.supports_out:
-                #     func(*args, **kwargs, out=expected)
 
         self.check_dtensor_func(test, op)
 
@@ -1065,29 +1104,46 @@ ops_unbacked_base_dde = {
 
 # Ops where DTensor shard prop has DDEs with unbacked (base tensor passes)
 ops_unbacked_dtensor_dde = {
+    xfail("__rmatmul__"),
+    xfail("argmax"),
+    xfail("argmin"),
+    xfail("argsort"),
     xfail("as_strided"),
     xfail("as_strided", "partial_views"),
     xfail("broadcast_tensors"),
     xfail("cartesian_prod"),
     xfail("diagflat"),
     xfail("expand_as"),
+    xfail("flatten"),
     xfail("gather"),
+    xfail("masked.argmax"),
+    xfail("masked.argmin"),
     xfail("masked.normalize"),
+    xfail("masked.std"),
+    xfail("masked.var"),
+    xfail("matmul"),
     xfail("meshgrid", "list_of_tensors"),
     xfail("meshgrid", "variadic_tensors"),
+    xfail("msort"),
     xfail("new_empty"),
     xfail("new_empty_strided"),
     xfail("new_full"),
     xfail("new_ones"),
     xfail("new_zeros"),
+    xfail("nn.functional.embedding"),
+    xfail("nn.functional.linear"),
     xfail("nn.functional.multi_margin_loss"),
     xfail("nn.functional.normalize"),
     xfail("outer"),
     xfail("ravel"),
+    xfail("repeat_interleave"),
+    xfail("reshape"),
     xfail("reshape_as"),
+    xfail("slice_scatter"),
+    xfail("sort"),
     xfail("squeeze"),
-    xfail("squeeze", "multiple"),
     xfail("topk"),
+    xfail("view"),
     xfail("view_as"),
 }
 
@@ -1156,64 +1212,69 @@ class TestUnbackedDTensorOps(TestDTensorOps):
         """Check if tensor has dimensions that can be marked as unbacked."""
         return t.ndim > 0 and any(s >= 2 for s in t.shape)
 
+    def _sample_has_valid_unbacked_dims(self, args, kwargs) -> bool:
+        """Check if any tensor in args/kwargs has valid unbacked dimensions."""
+        all_tensors = [
+            x for x in tree_flatten((args, kwargs))[0] if isinstance(x, torch.Tensor)
+        ]
+        return any(self._has_valid_unbacked_dims(t) for t in all_tensors)
+
     def _mark_unbacked(self, t: torch.Tensor) -> None:
         """Mark all eligible dimensions of a tensor as unbacked."""
         for i in range(t.ndim):
             if t.shape[i] >= 2:
                 torch._dynamo.decorators.mark_unbacked(t, i)
 
-    def _check_base_dde(self, func, args, kwargs):
-        """Check if base tensor (without DTensor) has DDEs."""
-        torch._dynamo.reset()
-
-        def mark_unbacked_tree(x):
-            if isinstance(x, torch.Tensor) and self._has_valid_unbacked_dims(x):
-                self._mark_unbacked(x)
-            return x
-
-        tree_map(mark_unbacked_tree, args)
-        tree_map(mark_unbacked_tree, kwargs)
-
-        @torch.compile(backend="eager", fullgraph=True)
-        def compiled_func(*a, **kw):
-            return func(*a, **kw)
-
-        try:
-            compiled_func(*args, **kwargs)
-            return False, None
-        except GuardOnDataDependentSymNode as e:
-            return True, str(e)[:200]
-        except Exception as e:
-            err_str = str(e)
-            if "Could not guard on data-dependent" in err_str or "Could not extract" in err_str:
-                return True, err_str[:200]
-            return False, None
-
     def _run_unbacked_dtensor_test(self, func, args, kwargs):
-        """Run DTensor op with unbacked dims and fullgraph compile."""
+        """
+        Run DTensor op with unbacked dims and fullgraph compile.
+        Tests ALL placement combinations and fails if ANY has a DDE.
+        Returns (success, error_msg) tuple.
+        """
         torch._dynamo.reset()
         dtc = DTensorConverter(self.mesh, args, kwargs)
 
+        any_tested = False
         for d_args, d_kwargs in dtc:
             if not dtc.successful():
                 continue
+
+            any_tested = True
+
+            # Need fresh copies for each placement since mark_unbacked mutates
+            d_args_copy = copy.deepcopy(d_args)
+            d_kwargs_copy = copy.deepcopy(d_kwargs)
 
             def mark_unbacked_tree(x):
                 if isinstance(x, DTensor) and self._has_valid_unbacked_dims(x):
                     self._mark_unbacked(x)
                 return x
 
-            tree_map(mark_unbacked_tree, d_args)
-            tree_map(mark_unbacked_tree, d_kwargs)
+            tree_map(mark_unbacked_tree, d_args_copy)
+            tree_map(mark_unbacked_tree, d_kwargs_copy)
 
             @torch.compile(backend="eager", fullgraph=True)
             def compiled_func(*a, **kw):
                 return func(*a, **kw)
 
-            compiled_func(*d_args, **d_kwargs)
-            return True  # Successfully ran
+            try:
+                torch._dynamo.reset()
+                compiled_func(*d_args_copy, **d_kwargs_copy)
+            except GuardOnDataDependentSymNode as e:
+                return False, f"DDE: {str(e)[:200]}"
+            except Exception as e:
+                err_str = str(e)
+                if (
+                    "Could not guard on data-dependent" in err_str
+                    or "Could not extract" in err_str
+                ):
+                    return False, f"DDE: {err_str[:200]}"
+                # Other errors are not DDEs, continue testing other placements
+                continue
 
-        return False  # No valid dtensor conversion
+        if not any_tested:
+            return None, "No valid dtensor conversion"
+        return True, None  # All placements passed
 
     @suppress_warnings
     @ops(_op_db, allowed_dtypes=(torch.float,))
@@ -1221,47 +1282,36 @@ class TestUnbackedDTensorOps(TestDTensorOps):
         _op_db,
         "TestUnbackedDTensorOps",
         "test_unbacked_dtensor_op_db",
-        dtensor_fails | ops_unbacked_base_dde | ops_unbacked_dtensor_dde | ops_unbacked_skip,
+        dtensor_fails
+        | ops_unbacked_base_dde
+        | ops_unbacked_dtensor_dde
+        | ops_unbacked_skip,
     )
     def test_unbacked_dtensor_op_db(self, dtype, op):
-        samples = list(op.sample_inputs(DEVICE_TYPE, dtype, requires_grad=False))
-
         any_tested = False
 
-        for sample in samples:
-            args = [sample.input] + list(sample.args)
-            kwargs = sample.kwargs
-            all_tensors = [
-                x
-                for x in tree_flatten((args, kwargs))[0]
-                if isinstance(x, torch.Tensor)
-            ]
-            if not any(self._has_valid_unbacked_dims(t) for t in all_tensors):
-                continue
-
-            try:
-                args_copy = copy.deepcopy(args)
-                kwargs_copy = copy.deepcopy(kwargs)
-            except NotImplementedError:
-                # Skip samples that can't be deepcopied (e.g., sparse tensors)
-                continue
-
+        for args, kwargs in self.iter_valid_samples(
+            op,
+            dtype,
+            requires_grad=False,
+            sample_filter=self._sample_has_valid_unbacked_dims,
+            needs_deepcopy=True,
+        ):
             any_tested = True
 
-            # First check if base tensor has DDEs (skip DTensor test if so)
-            is_base_dde, _ = self._check_base_dde(op.op, args_copy, kwargs_copy)
-            if is_base_dde:
-                self.fail(f"{op.name}: base tensor has DDE, should be in ops_unbacked_base_dde")
-
-            # Now run the DTensor test with unbacked dims
-            args_copy2 = copy.deepcopy(args)
-            kwargs_copy2 = copy.deepcopy(kwargs)
-            success = self._run_unbacked_dtensor_test(op.op, args_copy2, kwargs_copy2)
-            if success:
-                return  # At least one sample passed
+            # Run the DTensor test with unbacked dims - must pass ALL placements
+            success, err = self._run_unbacked_dtensor_test(op.op, args, kwargs)
+            if success is False:
+                self.fail(
+                    f"{op.name}: DTensor has DDE, should be in ops_unbacked_dtensor_dde. {err}"
+                )
+            elif success is True:
+                return  # All placements passed for this sample
 
         if not any_tested:
-            self.fail(f"{op.name}: no valid samples found, should be in ops_unbacked_skip")
+            self.fail(
+                f"{op.name}: no valid samples found, should be in ops_unbacked_skip"
+            )
 
 
 # only instantiate tests for DEVICE_TYPE alone (i.e. either CPU or GPU)
@@ -1271,7 +1321,9 @@ instantiate_device_type_tests(
 
 instantiate_device_type_tests(TestLocalDTensorOps, globals(), only_for=(DEVICE_TYPE,))
 
-instantiate_device_type_tests(TestUnbackedDTensorOps, globals(), only_for=(DEVICE_TYPE,))
+instantiate_device_type_tests(
+    TestUnbackedDTensorOps, globals(), only_for=(DEVICE_TYPE,)
+)
 
 if __name__ == "__main__":
     run_tests()
