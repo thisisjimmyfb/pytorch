@@ -415,7 +415,8 @@ def raise_observed_exception(
     kwargs: Optional[dict[str, Any]] = None,
 ) -> NoReturn:
     from .symbolic_convert import ExceptionVals
-    from .variables import BuiltinVariable, ConstantVariable, VariableTracker
+    from .variables import ConstantVariable, VariableTracker
+    from .variables.builder import SourcelessBuilder
 
     # Wrap any non-VariableTracker args in ConstantVariable
     def wrap_arg(arg: Any) -> VariableTracker:
@@ -427,7 +428,7 @@ def raise_observed_exception(
 
     # CPython here raises an exception. Since there is no python code, we have to manually setup the exception
     # stack and raise the exception.
-    exception_vt = BuiltinVariable(exc_type).call_function(
+    exception_vt = SourcelessBuilder.create(tx, exc_type).call_function(
         tx,  # pyrefly: ignore[bad-argument-type]
         wrapped_args,
         kwargs or {},
