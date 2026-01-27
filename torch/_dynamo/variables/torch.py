@@ -1277,7 +1277,7 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                 if placements_vt is None:
                     placements_vt = ConstantVariable.create(None)
                 elif isinstance(placements_vt, variables.UserDefinedObjectVariable):
-                    placements_vt = variables.BuiltinVariable(tuple).call_function(
+                    placements_vt = SourcelessBuilder.create(tx, tuple).call_function(
                         tx, [placements_vt], {}
                     )
 
@@ -2436,7 +2436,7 @@ For now, dynamo will explicitly graph break when it encounters user code with th
         packed_input_vt = TupleVariable.build(
             tx, (TupleVariable.build(tx, args), ConstDictVariable.build(tx, kwargs))
         )
-        out_vt = variables.UserFunctionVariable(tree_flatten).call_function(  # type: ignore[arg-type]
+        out_vt = SourcelessBuilder.create(tx, tree_flatten).call_function(  # type: ignore[arg-type]
             tx, [packed_input_vt], {}
         )
         assert isinstance(out_vt, TupleVariable) and len(out_vt.items) == 2
@@ -2613,7 +2613,7 @@ For now, dynamo will explicitly graph break when it encounters user code with th
 
         # Reuse the same pattern used above for tree_flatten: call the python
         # function through Dynamo so it symbolically interprets it.
-        out_vt = variables.UserFunctionVariable(_pytree.tree_unflatten).call_function(
+        out_vt = SourcelessBuilder.create(tx, _pytree.tree_unflatten).call_function(
             tx, [proxy_list_vt, out_spec_vt], {}
         )
 
