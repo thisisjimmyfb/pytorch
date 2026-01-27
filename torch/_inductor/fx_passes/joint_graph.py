@@ -387,9 +387,56 @@ class UniformValueConstantFolder(ConstantFolder):
         return self.unknown_value
 
 
+def _compute_ancestors(
+    nodes: typing.Iterable[torch.fx.Node],
+) -> dict[torch.fx.Node, OrderedSet[torch.fx.Node]]:
+    """
+    Compute transitive ancestors (dependencies) for each node.
+
+    Returns a dict mapping each node to the set of all nodes it transitively
+    depends on (including itself).
+    """
+    ancestors: dict[torch.fx.Node, OrderedSet[torch.fx.Node]] = {}
+
+    def get_ancestors(n: torch.fx.Node) -> OrderedSet[torch.fx.Node]:
+        if n in ancestors:
+            return ancestors[n]
+        result: OrderedSet[torch.fx.Node] = OrderedSet([n])
+        for arg in n.args:
+            if isinstance(arg, torch.fx.Node):
+                result.update(get_ancestors(arg))
+        ancestors[n] = result
+        return result
+
+    for node in nodes:
+        get_ancestors(node)
+    return ancestors
+
+
+def _has_self_referential_shape(
+    shapes: list,
+    node: torch.fx.Node,
+    ancestors: dict[torch.fx.Node, OrderedSet[torch.fx.Node]],
+) -> bool:
+    """
+    Check if any shape in `shapes` depends on `node`.
+
+    This is used to detect cycles when constant_fold_uniform_value creates a
+    replacement full() node whose shape includes a sym_size computed from the
+    original tensor being replaced.
+
+    Uses precomputed ancestors for O(1) lookup per shape node.
+    """
+    for shape_node in shapes:
+        if isinstance(shape_node, torch.fx.Node):
+            if node in ancestors.get(shape_node, ()):
+                return True
+    return False
+
+
 def constant_fold_uniform_value(gm: torch.fx.GraphModule):
+    """Runs constant folding and replaces constants which can be constructed with a single `full` call. Calls into remove_no_ops."""
     with torch.utils._python_dispatch._disable_current_modes():
-        "Runs constant folding and replaces constants which can be constructed with a single `full` call. Calls into remove_no_ops."
         aten = torch.ops.aten
 
         # Constant folding can leak memory, especially with repeated compilation, so we are only going to
@@ -419,6 +466,24 @@ def constant_fold_uniform_value(gm: torch.fx.GraphModule):
 
         for node in cf.node_replacements:
             constant_data_ptr_count[cf.constant_data_ptrs[node]] += 1
+
+        if not node_replacements:
+            remove_no_ops(gm, zeros, ones)
+            return
+
+        # Precompute ancestors for nodes representing shape dimensions to avoid
+        # O(N^2) traversals. These are FX nodes that compute symbolic integer
+        # dimensions (SymInt) used to construct the replacement full/zeros/ones tensors.
+        all_shape_nodes: list[torch.fx.Node] = []
+        for node in node_replacements:
+            node_shape = node_replacements_shapes[node]
+            for s in node_shape:
+                if isinstance(s, torch.SymInt) and s in cf.symint_nodes:
+                    shape_node = cf.symint_nodes[s]
+                    if isinstance(shape_node, torch.fx.Node):
+                        all_shape_nodes.append(shape_node)
+
+        shape_ancestors = _compute_ancestors(all_shape_nodes)
 
         for node, value in node_replacements.items():
             # we dont have a functional way right now of instantiating a non-contiguous tensor with full/zeros/ones right now
@@ -471,6 +536,11 @@ def constant_fold_uniform_value(gm: torch.fx.GraphModule):
                     cf.symint_nodes[s] if isinstance(s, torch.SymInt) else s
                     for s in node_replacements_shapes[node]
                 ]
+
+                # Check if any shape depends on a symint that was computed from
+                # the node being replaced - this would create a cycle
+                if _has_self_referential_shape(shapes, node, shape_ancestors):
+                    continue
 
                 # zeros and ones just get traced into full, so we insert those
                 new_node = graph.call_function(
