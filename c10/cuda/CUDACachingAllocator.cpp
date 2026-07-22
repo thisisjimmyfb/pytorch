@@ -537,18 +537,7 @@ struct ExpandableSegment {
           // Unlike the corresponding CUDA Driver API.
           (void)hipGetLastError();
 #endif
-          for (auto j : c10::irange(begin, i)) {
-            auto& maybe_handle = handles_.at(j);
-            TORCH_INTERNAL_ASSERT(maybe_handle.has_value());
-            auto h = *maybe_handle;
-            maybe_handle = std::nullopt;
-#ifdef USE_ROCM
-            C10_CUDA_CHECK(hipMemRelease(h.handle));
-#else
-            C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemRelease_(h.handle));
-#endif
-          }
-          trimHandles();
+          releaseHandles(begin, i);
           return rangeFromHandles(begin, begin);
         }
 #ifdef USE_ROCM
@@ -559,7 +548,9 @@ struct ExpandableSegment {
       }
       handles_.at(i) = Handle{.handle = handle};
     }
-    mapAndSetAccess(begin, end);
+    if (!mapAndSetAccess(begin, end)) {
+      return rangeFromHandles(begin, begin);
+    }
     return rangeFromHandles(begin, end);
   }
 
@@ -861,7 +852,7 @@ struct ExpandableSegment {
 #endif
   }
 
-  void setAccess(c10::DeviceIndex device, size_t begin, size_t end) {
+  bool setAccess(c10::DeviceIndex device, size_t begin, size_t end) {
 #if defined(USE_ROCM) && (ROCM_VERSION >= 70200)
     constexpr int num_desc = 2;
     std::array<CUmemAccessDesc, num_desc> desc{};
@@ -882,16 +873,43 @@ struct ExpandableSegment {
         (end - begin) * segment_size_,
         &desc[0],
         num_desc));
+    return true;
 #else
-    C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemSetAccess_(
-        ptr_ + begin * segment_size_,
-        (end - begin) * segment_size_,
-        &desc[0],
-        num_desc));
+    {
+      // cuMemSetAccess_ can transiently return CUDA_ERROR_NOT_READY when
+      // called concurrently from multiple threads. Retrying a few times has
+      // been observed to be the best mitigation from experiments.
+      constexpr int kMaxAttempts = 3;
+      constexpr auto kRetryDelay = std::chrono::milliseconds(100);
+      CUresult result = CUDA_SUCCESS;
+      for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        result = DriverAPI::get()->cuMemSetAccess_(
+            ptr_ + begin * segment_size_,
+            (end - begin) * segment_size_,
+            &desc[0],
+            num_desc);
+        if (result != CUDA_ERROR_NOT_READY) {
+          break;
+        }
+        std::this_thread::sleep_for(kRetryDelay);
+      }
+      if (result == CUDA_ERROR_OUT_OF_MEMORY) {
+        // A driver-level cudaErrorMemoryAllocation here can leave a sticky 
+        // error behind that a later, unrelated synchronous call would 
+        // observe even though that call itself didn't allocate anything.
+        cudaGetLastError();
+        return false;
+      }
+      C10_CUDA_DRIVER_CHECK(result);
+      return true;
+    }
 #endif
   }
 
-  void mapAndSetAccess(size_t begin, size_t end) {
+  // Returns false when mapping or setting access for [begin, end) fails,
+  // rolling back whatever was done so far. This lets the caller fall back
+  // to the caching allocator's normal cache-eviction-and-retry path
+  bool mapAndSetAccess(size_t begin, size_t end) {
     for (auto i : c10::irange(begin, end)) {
       auto& maybe_handle = handles_.at(i);
       TORCH_INTERNAL_ASSERT(maybe_handle.has_value());
@@ -903,20 +921,37 @@ struct ExpandableSegment {
           maybe_handle->handle,
           0ULL));
 #else
-      C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemMap_(
-          ptr_ + i * segment_size_,
-          segment_size_,
-          0,
-          maybe_handle->handle,
-          0ULL));
+      {
+        CUresult result = DriverAPI::get()->cuMemMap_(
+            ptr_ + i * segment_size_,
+            segment_size_,
+            0,
+            maybe_handle->handle,
+            0ULL);
+        if (result == CUDA_ERROR_OUT_OF_MEMORY) {
+          if (i > begin) {
+            unmapHandles(begin, i);
+          }
+          releaseHandles(i, end);
+          return false;
+        }
+        C10_CUDA_DRIVER_CHECK(result);
+      }
 #endif
       maybe_handle->mapped = true;
     }
-    mapped_size_ += (end - begin) * segment_size_;
-    setAccess(device_, begin, end);
-    for (auto p : peers_) {
-      setAccess(p, begin, end);
+    if (!setAccess(device_, begin, end)) {
+      unmapHandles(begin, end);
+      return false;
     }
+    for (auto p : peers_) {
+      if (!setAccess(p, begin, end)) {
+        unmapHandles(begin, end);
+        return false;
+      }
+    }
+    mapped_size_ += (end - begin) * segment_size_;
+    return true;
   }
 
   void unmapHandles(size_t begin, size_t end) {
@@ -968,6 +1003,22 @@ struct ExpandableSegment {
         std::views::reverse(handles_),
         [](const std::optional<Handle>& opt) { return opt.has_value(); });
     handles_.erase(it.base(), handles_.end());
+  }
+  // Releases handles in [begin, end) that are unmapped, unlike
+  // unmapHandles() which expects mapped handles.
+  void releaseHandles(size_t begin, size_t end) {
+    for (auto j : c10::irange(begin, end)) {
+      auto& maybe_handle = handles_.at(j);
+      TORCH_INTERNAL_ASSERT(maybe_handle.has_value());
+      auto h = *maybe_handle;
+      maybe_handle = std::nullopt;
+#ifdef USE_ROCM
+      C10_CUDA_CHECK(hipMemRelease(h.handle));
+#else
+      C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemRelease_(h.handle));
+#endif
+    }
+    trimHandles();
   }
   void forEachAllocatedRange(const std::function<void(size_t, size_t)>& fn) {
     size_t start = 0;
